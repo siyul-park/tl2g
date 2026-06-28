@@ -7,7 +7,11 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/siyul-park/minivm/optimize"
 	"github.com/siyul-park/tl2g"
+	"github.com/siyul-park/tl2g/compile"
+	"github.com/siyul-park/tl2g/model"
+	"github.com/siyul-park/tl2g/predict"
 )
 
 type golden struct {
@@ -67,6 +71,51 @@ func TestPredictMatchesLightGBM(t *testing.T) {
 			}
 			t.Logf("%s: %d rows, max abs diff %.3g", name, len(out), maxDiff)
 		})
+	}
+}
+
+func TestPredictWithOptLevel(t *testing.T) {
+	const tol = 1e-6
+
+	levels := []struct {
+		name  string
+		level optimize.Level
+	}{
+		{name: "O2", level: optimize.O2},
+		{name: "O3", level: optimize.O3},
+	}
+	for _, name := range []string{"regression", "binary"} {
+		for _, level := range levels {
+			t.Run(name+"/"+level.name, func(t *testing.T) {
+				g := loadGolden(t, name)
+				m, err := model.Load(filepath.Join("testdata", name+".mdl"))
+				if err != nil {
+					t.Fatalf("Load: %v", err)
+				}
+				cm, err := compile.Compile(m, compile.WithOptLevel(level.level))
+				if err != nil {
+					t.Fatalf("Compile: %v", err)
+				}
+				p, err := predict.New(cm)
+				if err != nil {
+					t.Fatalf("NewPredictor: %v", err)
+				}
+				defer p.Close()
+
+				out, err := p.Predict(tl2g.NewDMatrix(g.X))
+				if err != nil {
+					t.Fatalf("Predict: %v", err)
+				}
+				if len(out) != len(g.Pred) {
+					t.Fatalf("len mismatch: got %d want %d", len(out), len(g.Pred))
+				}
+				for i := range out {
+					if d := math.Abs(out[i] - g.Pred[i]); d > tol {
+						t.Errorf("row %d: got %.10f want %.10f (diff %.3g)", i, out[i], g.Pred[i], d)
+					}
+				}
+			})
+		}
 	}
 }
 

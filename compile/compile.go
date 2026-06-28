@@ -41,13 +41,7 @@ type options struct {
 type Option func(*options)
 
 // WithOptLevel sets the minivm optimizer level applied to the emitted program
-// (O0 disables optimization). Defaults to O1.
-//
-// O1 runs cheap local rewrites (constant folding and constant deduplication),
-// which are safe for this code shape. O2/O3 add CFG passes (block reordering,
-// dead-code elimination, global value numbering) that currently reject these
-// deeply branched tree programs with an "invalid jump" error, so they are not
-// the default; revisit once the minivm optimizer handles them.
+// (O0 disables optimization). Defaults to O3.
 func WithOptLevel(level optimize.Level) Option {
 	return func(o *options) { o.optLevel = level }
 }
@@ -69,7 +63,7 @@ func Compile(m *model.Model, opts ...Option) (*CompiledModel, error) {
 		return nil, fmt.Errorf("compile: num_class=%d unsupported (POC: 1)", m.NumClass)
 	}
 
-	opt := options{optLevel: optimize.O1}
+	opt := options{optLevel: optimize.O3}
 	for _, o := range opts {
 		o(&opt)
 	}

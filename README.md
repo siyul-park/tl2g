@@ -56,48 +56,31 @@ Validated against LightGBM's own `predict` over 200 held-out rows
 
 ## Throughput
 
-`go test -bench . -benchmem` — Apple M4 Pro, Go 1.26.2, 30-tree models,
+`go test -bench . -benchmem ./...` — Apple M4 Pro, Go 1.26.2, 30-tree models,
 pure Go (no cgo):
 
 | Benchmark | ns/op | allocs/op |
 |---|---|---|
-| single row, regression (10 feat) | ~2,600 | 2 |
-| single row, binary (12 feat) | ~1,700 | 2 |
-| batch 200 rows, regression | ~3,600 / row | — |
-| batch 200 rows, binary | ~2,800 / row | — |
+| single row, regression (10 feat) | ~2,617 | 2 |
+| single row, binary (12 feat) | ~1,733 | 2 |
+| batch 200 rows, regression | ~3,672 / row | 202 |
+| batch 200 rows, binary | ~2,890 / row | 202 |
 
 ### vs LightGBM and TL2cgen
 
-Batch prediction, ns/row, same fixtures (`python scripts/bench_compare.py`):
+Batch prediction, ns/row, same fixtures (`python3 scripts/bench_compare.py`):
 
 | Model | LightGBM (C) | TL2cgen (C) | **tl2g (Go bytecode)** |
 |---|---|---|---|
-| regression | ~282 | ~310 | ~3,640 |
-| binary | ~384 | ~354 | ~2,846 |
-
-tl2g currently trails the native-C runtimes by ~9–13×, as expected for a pure-Go
-bytecode VM with no cgo. The POC goal — bit-exact accuracy with a tl2cgen-style
-API and a portable, dependency-free Go artifact — is met.
+| regression | ~282 | ~310 | ~3,672 |
+| binary | ~384 | ~354 | ~2,890 |
 
 ### On the optimizer and the JIT
 
-The emitted bytecode is run through the minivm optimizer at **O1** (cheap local
-rewrites). O2/O3 add CFG passes that currently reject these deeply branched tree
-programs with an `invalid jump` error, so O1 is the safe default
-(`compile.WithOptLevel` overrides it).
-
-The tree-walk is emitted into a minivm **function** that the top-level code
-`CALL`s, specifically so it is **JIT-eligible** — minivm only traces code
-reached through a call (frame address > 0), never top-level module code. With
-that change the trace JIT does engage, but it does **not** speed up tree
-inference: measured pure-interpreter vs aggressive-JIT is ~3,740 vs ~3,830 ns/row
-(JIT marginally *slower*). Decision-tree evaluation is the canonical worst case
-for a trace JIT — every input row walks a different root-to-leaf path, so a
-recorded trace's branch guards fail on most rows and force constant side-exit
-deopts. Closing the gap needs a tree-shaped strategy (e.g. compiling each split
-to native straight-line code, batching the row loop into bytecode), not the
-trace JIT. `predict` keeps the JIT at its default threshold; `interp.WithThreshold(-1)`
-would pin a pure interpreter.
+The emitted bytecode uses minivm optimizer **O3** by default
+(`compile.WithOptLevel` overrides it). The tree-walk lives in a called function,
+so it is JIT-eligible, but branch-heavy tree inference currently relies on the
+threaded interpreter path for best throughput.
 
 ## Regenerating fixtures
 
@@ -114,6 +97,3 @@ own output — the accuracy oracle.
 ## Requirements
 
 - Go 1.26.2+ (minivm requirement)
-- Prediction runs on minivm's threaded interpreter. The trace JIT is eligible
-  (the eval body is a called function) but does not benefit tree inference — see
-  [On the optimizer and the JIT](#on-the-optimizer-and-the-jit).
