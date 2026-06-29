@@ -61,10 +61,10 @@ pure Go (no cgo):
 
 | Benchmark | ns/op | allocs/op |
 |---|---|---|
-| single row, regression (10 feat) | ~2,617 | 2 |
-| single row, binary (12 feat) | ~1,733 | 2 |
-| batch 200 rows, regression | ~3,672 / row | 202 |
-| batch 200 rows, binary | ~2,890 / row | 202 |
+| single row, regression (10 feat) | ~602 | 2 |
+| single row, binary (12 feat) | ~443 | 2 |
+| batch 200 rows, regression | ~3,819 / row | 893 |
+| batch 200 rows, binary | ~3,298 / row | 2,020 |
 
 ### vs LightGBM and TL2cgen
 
@@ -72,15 +72,18 @@ Batch prediction, ns/row, same fixtures (`python3 scripts/bench_compare.py`):
 
 | Model | LightGBM (C) | TL2cgen (C) | **tl2g (Go bytecode)** |
 |---|---|---|---|
-| regression | ~282 | ~310 | ~3,672 |
-| binary | ~384 | ~354 | ~2,890 |
+| regression | ~282 | ~310 | ~3,819 |
+| binary | ~384 | ~354 | ~3,298 |
 
 ### On the optimizer and the JIT
 
 The emitted bytecode uses minivm optimizer **O3** by default
 (`compile.WithOptLevel` overrides it). The tree-walk lives in a called function,
-so it is JIT-eligible, but branch-heavy tree inference currently relies on the
-threaded interpreter path for best throughput.
+so it is JIT-eligible. With minivm's constant-ref trace fix and full-trace
+`ARRAY_GET` lowering for f64 feature reads, 30-tree fixtures emit native traces
+in the JIT diagnostics (`emits>=1`, `attempts>=1`). Single-row throughput now
+spends most of the tree walk in native code; batch prediction still pays for
+shared feature-buffer rewrites and per-call result handling.
 
 ## Regenerating fixtures
 

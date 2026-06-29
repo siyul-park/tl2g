@@ -1,13 +1,18 @@
 package tl2g_test
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
+	"github.com/siyul-park/minivm/interp"
 	"github.com/siyul-park/minivm/optimize"
+	"github.com/siyul-park/minivm/prof"
+	"github.com/siyul-park/minivm/types"
 	"github.com/siyul-park/tl2g"
 	"github.com/siyul-park/tl2g/compile"
 	"github.com/siyul-park/tl2g/model"
@@ -71,6 +76,63 @@ func TestPredictMatchesLightGBM(t *testing.T) {
 			}
 			t.Logf("%s: %d rows, max abs diff %.3g", name, len(out), maxDiff)
 		})
+	}
+}
+
+func TestCompiledModelJITEmits(t *testing.T) {
+	if runtime.GOARCH != "arm64" {
+		t.Skip("native JIT is only available on arm64")
+	}
+	const tol = 1e-6
+
+	g := loadGolden(t, "regression")
+	m, err := model.Load(filepath.Join("testdata", "regression.mdl"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cm, err := compile.Compile(m)
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	p := prof.New()
+	vm := interp.New(cm.Program, interp.WithTick(1), interp.WithThreshold(1), interp.WithProfiler(p))
+	ctx := context.Background()
+
+	for i := 0; i < 256; i++ {
+		row := g.X[i%len(g.X)]
+		vm.Reset()
+		for j := range cm.FeatBuf {
+			if j < len(row) {
+				cm.FeatBuf[j] = row[j]
+			} else {
+				cm.FeatBuf[j] = 0
+			}
+		}
+		if err := vm.Run(ctx); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		got, err := vm.Pop()
+		if err != nil {
+			t.Fatalf("Pop: %v", err)
+		}
+		margin, ok := got.(types.F64)
+		if !ok {
+			t.Fatalf("result type %T", got)
+		}
+		if d := math.Abs(float64(margin) - g.Raw[i%len(g.Raw)]); d > tol {
+			t.Fatalf("row %d: got raw %.10f want %.10f (diff %.3g)", i, margin, g.Raw[i%len(g.Raw)], d)
+		}
+	}
+	if err := vm.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	attempts, _ := p.Metric("vm_jit_attempts_total")
+	emits, _ := p.Metric("vm_jit_emits_total")
+	if attempts < 1 {
+		t.Fatalf("vm_jit_attempts_total = %.0f, want >= 1", attempts)
+	}
+	if emits < 1 {
+		t.Fatalf("vm_jit_emits_total = %.0f, want >= 1", emits)
 	}
 }
 

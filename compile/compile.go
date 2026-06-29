@@ -8,10 +8,10 @@
 // per row) correct.
 //
 // The tree-walk is emitted into a minivm *function* that the top-level code
-// CALLs. minivm only traces and JIT-compiles code reached through a call
-// (frame address > 0); top-level module code is never a JIT candidate. Putting
-// the hot evaluation behind a CALL therefore makes it eligible for the trace
-// JIT once it warms up.
+// CALLs, so the hot evaluation is a clean trace-JIT root once it warms up.
+// (Recent minivm also traces top-level module code, so the CALL is no longer
+// required purely for JIT eligibility, but keeping eval as its own function
+// keeps the hot body isolated.)
 //
 // Feature input is a single mutable F64 array interned as a program constant.
 // The Predictor writes the current row into CompiledModel.FeatBuf before each
