@@ -7,17 +7,10 @@
 // and the code uses no locals — which keeps Interpreter.Reset (used to re-run
 // per row) correct.
 //
-// The tree-walk is emitted into a minivm *function* that the top-level code
-// CALLs, so the hot evaluation is a clean trace-JIT root once it warms up.
-// (Recent minivm also traces top-level module code, so the CALL is no longer
-// required purely for JIT eligibility, but keeping eval as its own function
-// keeps the hot body isolated.)
-//
-// Feature input is a single mutable F64 array interned as a program constant.
-// The Predictor writes the current row into CompiledModel.FeatBuf before each
-// run; bytecode reads it via ARRAY_GET. Because the buffer backing is shared
-// with the constant, a CompiledModel drives one Predictor and is not safe for
-// concurrent prediction.
+// Feature input is an F64 array stored into each interpreter's copy of the
+// feature constant before Run. Splits read it with CONST_GET + ARRAY_GET. This
+// keeps row state interpreter-local, so pooled interpreters can evaluate one
+// shared Program concurrently.
 package compile
 
 import (
@@ -50,14 +43,23 @@ func WithOptLevel(level optimize.Level) Option {
 // Predictor needs to feed inputs and post-process outputs.
 type CompiledModel struct {
 	Program    *program.Program
-	FeatBuf    []float64 // shared backing of the feature-array constant
+	FeatureIdx int // constant-pool slot holding the feature row
 	NumFeature int
 	Objective  model.Objective
+
+	// BatchProgram evaluates BatchCapacity rows per Run: it reads
+	// BatchCapacity*NumFeature values from the constant at BatchInputIdx
+	// (row-major) and writes BatchCapacity margins to the constant at
+	// BatchOutputIdx. Callers must zero-pad any unused input rows; the
+	// program always evaluates all BatchCapacity rows.
+	BatchProgram   *program.Program
+	BatchInputIdx  int
+	BatchOutputIdx int
+	BatchCapacity  int
 }
 
-// Compile lowers m into a minivm program. The optimizer runs over the
-// top-level code (configurable via WithOptLevel); the eval function's body is
-// left for the interpreter's threaded compiler and the trace JIT.
+// Compile lowers m into a top-level minivm program that leaves one raw margin
+// f64 on the stack.
 func Compile(m *model.Model, opts ...Option) (*CompiledModel, error) {
 	if m.NumClass != 1 {
 		return nil, fmt.Errorf("compile: num_class=%d unsupported (POC: 1)", m.NumClass)
@@ -69,23 +71,16 @@ func Compile(m *model.Model, opts ...Option) (*CompiledModel, error) {
 	}
 
 	b := program.NewBuilder()
+	featIdx := b.Const(types.TypedArray[float64](make([]float64, m.NumFeature())))
 
-	featBuf := make([]float64, m.NumFeature())
-	featArr := types.TypedArray[float64](featBuf)
-
-	// Reserve the feature array's constant-pool slot up front so the eval
-	// function body can reference it by index via CONST_GET.
-	featIdx := b.Const(featArr)
-
-	fn, err := buildEval(m, featIdx)
-	if err != nil {
-		return nil, err
+	b.Emit(instr.F64_CONST, math.Float64bits(0))
+	for ti := range m.Trees {
+		if err := emitTree(b, &m.Trees[ti], featIdx); err != nil {
+			return nil, fmt.Errorf("compile: tree %d: %w", ti, err)
+		}
 	}
-
-	// Top level: call eval() and leave its returned margin on the stack as the
-	// program result.
-	b.ConstGet(fn)
-	b.Emit(instr.CALL)
+	b.Emit(instr.F64_CONST, 0)
+	b.Emit(instr.DROP)
 
 	prog, err := b.Build()
 	if err != nil {
@@ -100,48 +95,124 @@ func Compile(m *model.Model, opts ...Option) (*CompiledModel, error) {
 		prog = optimized
 	}
 
+	batchProg, inputIdx, outputIdx, err := buildBatchProgram(m, opt.optLevel, DefaultBatchCapacity)
+	if err != nil {
+		return nil, fmt.Errorf("compile: batch: %w", err)
+	}
+
 	return &CompiledModel{
-		Program:    prog,
-		FeatBuf:    featBuf,
-		NumFeature: m.NumFeature(),
-		Objective:  m.Objective,
+		Program:        prog,
+		FeatureIdx:     featIdx,
+		NumFeature:     m.NumFeature(),
+		Objective:      m.Objective,
+		BatchProgram:   batchProg,
+		BatchInputIdx:  inputIdx,
+		BatchOutputIdx: outputIdx,
+		BatchCapacity:  DefaultBatchCapacity,
 	}, nil
 }
 
-// buildEval emits the whole ensemble into a no-arg function returning one f64
-// (the raw margin). featIdx is the feature array's index in the program's
-// constant pool, referenced by CONST_GET in every split.
-func buildEval(m *model.Model, featIdx int) (*types.Function, error) {
-	fb := types.NewFunctionBuilder(nil).WithReturns(types.TypeF64)
+// DefaultBatchCapacity is the number of rows CompileBatch evaluates per Run.
+const DefaultBatchCapacity = 32
 
-	// accumulator (margin) starts at 0 on the operand stack
-	fb.Emit(instr.New(instr.F64_CONST, math.Float64bits(0)))
+// batch-loop local slot indices.
+const (
+	batchLocalRow = iota
+	batchLocalBase
+)
 
+// buildBatchProgram lowers m into a program that loops over capacity rows in
+// one Run: row-major input lives in a constant array at inputIdx sized
+// capacity*NumFeature, and per-row margins are written to a constant array at
+// outputIdx sized capacity. The loop counter (row) and each row's flattened
+// base offset (row*NumFeature) live in locals so LOCAL_GET/LOCAL_SET can JIT.
+func buildBatchProgram(m *model.Model, optLevel optimize.Level, capacity int) (*program.Program, int, int, error) {
+	b := program.NewBuilder()
+	b.Locals(types.TypeI32, types.TypeI32)
+
+	inputIdx := b.Const(types.TypedArray[float64](make([]float64, capacity*m.NumFeature())))
+	outputIdx := b.Const(types.TypedArray[float64](make([]float64, capacity)))
+
+	b.Emit(instr.I32_CONST, 0)
+	b.Emit(instr.LOCAL_SET, batchLocalRow)
+
+	loopStart := b.Label()
+	b.Bind(loopStart)
+
+	// base = row * numFeature
+	b.Emit(instr.LOCAL_GET, batchLocalRow)
+	b.Emit(instr.I32_CONST, uint64(uint32(m.NumFeature())))
+	b.Emit(instr.I32_MUL)
+	b.Emit(instr.LOCAL_SET, batchLocalBase)
+
+	// output[row] = sum(tree contributions), pushed ref/index before the
+	// accumulator so the final F64 lands on top for ARRAY_SET's pop order.
+	b.Emit(instr.CONST_GET, uint64(outputIdx))
+	b.Emit(instr.LOCAL_GET, batchLocalRow)
+	b.Emit(instr.F64_CONST, math.Float64bits(0))
 	for ti := range m.Trees {
-		if err := emitTree(fb, &m.Trees[ti], featIdx); err != nil {
-			return nil, fmt.Errorf("compile: tree %d: %w", ti, err)
+		if err := emitTreeBatch(b, &m.Trees[ti], inputIdx); err != nil {
+			return nil, 0, 0, fmt.Errorf("tree %d: %w", ti, err)
 		}
 	}
+	b.Emit(instr.ARRAY_SET)
 
-	// return the accumulated margin (top of stack)
-	fb.Emit(instr.New(instr.RETURN))
+	// row++; loop while row < capacity
+	b.Emit(instr.LOCAL_GET, batchLocalRow)
+	b.Emit(instr.I32_CONST, 1)
+	b.Emit(instr.I32_ADD)
+	b.Emit(instr.LOCAL_SET, batchLocalRow)
+	b.Emit(instr.LOCAL_GET, batchLocalRow)
+	b.Emit(instr.I32_CONST, uint64(uint32(capacity)))
+	b.Emit(instr.I32_LT_S)
+	b.BrIf(loopStart)
 
-	fn, err := fb.Build()
+	prog, err := b.Build()
 	if err != nil {
-		return nil, fmt.Errorf("compile: build eval: %w", err)
+		return nil, 0, 0, fmt.Errorf("build: %w", err)
 	}
-	return fn, nil
+
+	if optLevel > optimize.O0 {
+		optimized, err := optimize.NewOptimizer(optLevel).Optimize(prog)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("optimize: %w", err)
+		}
+		prog = optimized
+	}
+
+	return prog, inputIdx, outputIdx, nil
+}
+
+// emitTreeBatch emits one tree with feature k read from input[base+k].
+func emitTreeBatch(b *program.Builder, t *model.Tree, inputIdx int) error {
+	return emitTreeFeatures(b, t, func(node int) {
+		b.Emit(instr.CONST_GET, uint64(inputIdx))
+		b.Emit(instr.LOCAL_GET, batchLocalBase)
+		b.Emit(instr.I32_CONST, uint64(uint32(t.SplitFeature[node])))
+		b.Emit(instr.I32_ADD)
+		b.Emit(instr.ARRAY_GET)
+	})
 }
 
 // emitTree emits one tree starting at its root (node 0). A degenerate
 // single-leaf tree (no internal nodes) emits leaf 0 directly.
-func emitTree(fb *types.FunctionBuilder, t *model.Tree, featIdx int) error {
+func emitTree(b *program.Builder, t *model.Tree, featIdx int) error {
+	return emitTreeFeatures(b, t, func(node int) {
+		b.Emit(instr.CONST_GET, uint64(featIdx))
+		b.Emit(instr.I32_CONST, uint64(uint32(t.SplitFeature[node])))
+		b.Emit(instr.ARRAY_GET)
+	})
+}
+
+// emitTreeFeatures emits the shared tree control flow, using emitFeature for
+// the single-row or flattened-batch feature-addressing scheme.
+func emitTreeFeatures(b *program.Builder, t *model.Tree, emitFeature func(int)) error {
 	// emitLeaf adds this leaf's contribution to the accumulator already on the
 	// stack: [acc] -> [acc + leaf_value]. LightGBM bakes the learning rate into
 	// the stored leaf_value, so the shrinkage field is not re-applied here.
 	emitLeaf := func(leaf int) {
-		fb.Emit(instr.New(instr.F64_CONST, math.Float64bits(t.LeafValue[leaf])))
-		fb.Emit(instr.New(instr.F64_ADD))
+		b.Emit(instr.F64_CONST, math.Float64bits(t.LeafValue[leaf]))
+		b.Emit(instr.F64_ADD)
 	}
 
 	if len(t.SplitFeature) == 0 {
@@ -155,22 +226,19 @@ func emitTree(fb *types.FunctionBuilder, t *model.Tree, featIdx int) error {
 	var emitChild func(child int)
 	var emitNode func(node int)
 	emitNode = func(node int) {
-		// push feature value: featArr[split_feature[node]]
-		fb.Emit(instr.New(instr.CONST_GET, uint64(featIdx)))
-		fb.Emit(instr.New(instr.I32_CONST, uint64(uint32(t.SplitFeature[node]))))
-		fb.Emit(instr.New(instr.ARRAY_GET))
+		emitFeature(node)
 		// compare: feature <= threshold
-		fb.Emit(instr.New(instr.F64_CONST, math.Float64bits(t.Threshold[node])))
-		fb.Emit(instr.New(instr.F64_LE))
+		b.Emit(instr.F64_CONST, math.Float64bits(t.Threshold[node]))
+		b.Emit(instr.F64_LE)
 
-		left := fb.Label()
-		end := fb.Label()
-		fb.BrIf(left) // feature <= threshold -> left child
+		left := b.Label()
+		end := b.Label()
+		b.BrIf(left) // feature <= threshold -> left child
 		emitChild(t.RightChild[node])
-		fb.Br(end)
-		fb.Bind(left)
+		b.Br(end)
+		b.Bind(left)
 		emitChild(t.LeftChild[node])
-		fb.Bind(end)
+		b.Bind(end)
 	}
 	emitChild = func(child int) {
 		if model.IsLeaf(child) {

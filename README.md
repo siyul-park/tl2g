@@ -17,9 +17,9 @@ portable bytecode for the minivm interpreter/JIT instead of C.
 
 Each decision tree is lowered to a nested branch block: a feature compare
 (`ARRAY_GET` + `F64_LE`) drives a `BR_IF`, and each leaf adds its `leaf_value`
-to a margin accumulator carried on the operand stack. The feature row is a
-single mutable `F64` array constant the predictor rewrites per row (no
-per-prediction allocation of the input). Binary objectives apply the sigmoid
+to a margin accumulator carried on the operand stack. Each interpreter receives
+its own feature-row buffer once and mutates that buffer in place between runs.
+Binary objectives apply the sigmoid
 transform in Go after the bytecode returns the raw margin.
 
 ## Usage
@@ -32,6 +32,12 @@ out, _ := p.Predict(tl2g.NewDMatrix(X)) // X is [][]float64, row-major
 ```
 
 Or step by step: `tl2g.Load` → `tl2g.Compile` → `tl2g.NewPredictor`.
+Batch prediction uses an `interp.Pool`; set parallelism with
+`tl2g.WithPoolSize(n)`. The default is `runtime.GOMAXPROCS(0)`. Predictors
+enable minivm native JIT by default with an aggressive threshold. Batch traces
+that exceed the safe register budget fall back to threaded dispatch instead of
+spilling across their terminal `ARRAY_SET`. Use `tl2g.WithJITThreshold(n)` to
+tune hotness, or `-1` to disable JIT.
 
 ## Scope (POC)
 
@@ -42,7 +48,9 @@ Or step by step: `tl2g.Load` → `tl2g.Compile` → `tl2g.NewPredictor`.
 | `regression`, `binary` | other objectives' transforms |
 
 Categorical splits (`decision_type` bit 0, or `num_cat > 0`) are rejected with a
-clear error. A `Predictor` is single-threaded (shared feature buffer).
+clear error. A `Predictor` owns a bounded interpreter pool. One `Predict` call
+may evaluate rows in parallel; do not call `Predict` concurrently on the same
+Predictor.
 
 ## Accuracy
 
@@ -56,15 +64,17 @@ Validated against LightGBM's own `predict` over 200 held-out rows
 
 ## Throughput
 
-`go test -bench . -benchmem ./...` — Apple M4 Pro, Go 1.26.2, 30-tree models,
-pure Go (no cgo):
+`go test -bench 'BenchmarkPredict(Single|Batch)' -benchmem ./...` — Apple M4
+Pro, Go 1.26.2, 30-tree models, pure Go (no cgo):
 
 | Benchmark | ns/op | allocs/op |
 |---|---|---|
-| single row, regression (10 feat) | ~602 | 2 |
-| single row, binary (12 feat) | ~443 | 2 |
-| batch 200 rows, regression | ~3,819 / row | 893 |
-| batch 200 rows, binary | ~3,298 / row | 2,020 |
+| single row, regression (10 feat) | ~1,590 | 1 |
+| single row, binary (12 feat) | ~959 | 1 |
+| batch 200 rows, regression | ~6,000 / row | 12 per batch |
+| batch 200 rows, binary | ~5,150 / row | 12 per batch |
+| batch 10,000 rows, regression | ~3,280 / row | 28-29 per batch |
+| batch 10,000 rows, binary | ~2,890 / row | 28 per batch |
 
 ### vs LightGBM and TL2cgen
 
@@ -72,18 +82,17 @@ Batch prediction, ns/row, same fixtures (`python3 scripts/bench_compare.py`):
 
 | Model | LightGBM (C) | TL2cgen (C) | **tl2g (Go bytecode)** |
 |---|---|---|---|
-| regression | ~282 | ~310 | ~3,819 |
-| binary | ~384 | ~354 | ~3,298 |
+| regression | not measured locally (`numpy` missing) | not measured locally | ~3,280 |
+| binary | not measured locally (`numpy` missing) | not measured locally | ~2,890 |
 
 ### On the optimizer and the JIT
 
 The emitted bytecode uses minivm optimizer **O3** by default
-(`compile.WithOptLevel` overrides it). The tree-walk lives in a called function,
-so it is JIT-eligible. With minivm's constant-ref trace fix and full-trace
-`ARRAY_GET` lowering for f64 feature reads, 30-tree fixtures emit native traces
-in the JIT diagnostics (`emits>=1`, `attempts>=1`). Single-row throughput now
-spends most of the tree walk in native code; batch prediction still pays for
-shared feature-buffer rewrites and per-call result handling.
+(`compile.WithOptLevel` overrides it). `TestCompiledModelJITEmits` verifies
+native trace emission directly, and `TestPredictorJITEmits` verifies predictor
+emission. The batch pool enables JIT, while minivm safely declines spilling for
+high-pressure terminal-mutation traces and continues those paths in threaded
+dispatch. Each VM run still amortizes host overhead over 32 rows.
 
 ## Regenerating fixtures
 

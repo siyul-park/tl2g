@@ -2,12 +2,14 @@ package tl2g_test
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/siyul-park/minivm/interp"
 	"github.com/siyul-park/minivm/prof"
+	"github.com/siyul-park/minivm/types"
 
 	"github.com/siyul-park/tl2g/compile"
 	"github.com/siyul-park/tl2g/model"
@@ -15,6 +17,10 @@ import (
 
 // Diagnostic: does tl2g's eval actually JIT, and does it help?
 func TestDiagJIT(t *testing.T) {
+	if os.Getenv("TL2G_DIAG") == "" {
+		t.Skip("set TL2G_DIAG=1 to run JIT diagnostics")
+	}
+
 	g := loadGolden(t, "regression")
 	mFull, err := model.Load(filepath.Join("testdata", "regression.mdl"))
 	if err != nil {
@@ -28,9 +34,17 @@ func TestDiagJIT(t *testing.T) {
 		vm := interp.New(cm.Program, interp.WithThreshold(threshold), interp.WithProfiler(p))
 		const N = 200000
 		start := time.Now()
+		buf := make(types.TypedArray[float64], cm.NumFeature)
+		featureConst, err := vm.Const(cm.FeatureIdx)
+		if err != nil {
+			t.Fatal(err)
+		}
 		for i := 0; i < N; i++ {
 			vm.Reset()
-			copy(cm.FeatBuf, g.X[i%len(g.X)]) // vary branch paths each run
+			copy(buf, g.X[i%len(g.X)]) // vary branch paths each run
+			if err := vm.Store(featureConst.Ref(), buf); err != nil {
+				t.Fatal(err)
+			}
 			if err := vm.Run(ctx); err != nil {
 				t.Fatal(err)
 			}
